@@ -32,29 +32,18 @@ docker compose down -v
 
 The old unseal key, `<username>` password and `<username>_admin` password stop working. Remove them from your password manager once the new ones are saved.
 
-### 2. Your username and the network (once per machine)
+### 2. Your username
 
 Every script works under one username of your choosing: it's your OpenBao login, and your PostgreSQL admin login is `<username>_admin`. The first script you run asks for it and saves it to `settings.local.json` in the repo root, which is gitignored, so your name never ends up in the repo (`settings.example.json` shows the format). Use lowercase letters, digits and `_`, starting with a letter. To override it, pass `-UserName` to any script or set the `LDS_USERNAME` environment variable.
-
-```powershell
-docker network create local-dev-stack     # "already exists" is fine
-```
 
 ### 3. OpenBao
 
 ```powershell
 cd C:\Repositories\GitHub\local-dev-stack\openbao
-docker compose up -d
-docker exec -it openbao bao operator init -key-shares=1 -key-threshold=1 -address=http://127.0.0.1:8200
-```
-
-Save the **unseal key** in your password manager. Keep the **root token** handy for the next two minutes only; never paste either anywhere else.
-
-```powershell
 .\scripts\Initialize-OpenBao.ps1
 ```
 
-`Initialize-OpenBao.ps1` unseals OpenBao for you. It asks for the unseal key, the root token, and a new password for your `<username>` login. Generate the password in your password manager: 64 characters is plenty, and more than 72 won't work. When it finishes, it has revoked the root token, so delete it.
+`Initialize-OpenBao.ps1` creates the `local-dev-stack` Docker network if it's missing, starts the container, initialises OpenBao and unseals it. It shows the **unseal key** once and waits until you type `saved`: put it in your password manager, and never paste it anywhere else. The root token is never shown; the script uses it and revokes it. Then it asks for a new password for your `<username>` login: generate it in your password manager. 64 characters is plenty, and more than 72 won't work.
 
 ```powershell
 .\tests\Test-OpenBao.ps1                  # restarts OpenBao once, so it asks for the unseal key again

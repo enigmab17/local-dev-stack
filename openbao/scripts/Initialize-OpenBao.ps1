@@ -1,14 +1,19 @@
 <#
 .SYNOPSIS
-  OpenBao admin setup: audit log, policies and your own login. Leaves no root token behind.
+  OpenBao setup: starts it, initialises it the first time, then sets up the audit log,
+  policies and your own login. Leaves no root token behind.
 .DESCRIPTION
+  It creates the local-dev-stack Docker network if it's missing and starts the container
+  (docker compose up -d). If OpenBao has never been initialised, it initialises it with
+  one unseal key share: the unseal key is shown once and the script waits until you've
+  saved it. The root token stays in memory and is never shown.
+
   You never need to keep a root token. This script makes a temporary one, does its work
   and revokes it:
     - Usual run: you log in as your own user (see Resolve-StackUserName) and give the unseal key.
       OpenBao only issues a root token when it gets both.
-    - First run (your user doesn't exist yet): you paste the root token printed by
-      'bao operator init', one last time. Once your login is set up and checked, that
-      token is revoked too.
+    - First run: it uses the root token from initialising, which you never see. Once your
+      login is set up and checked, that token is revoked too.
 
   With that temporary root token it:
     1. checks the audit log is on. It's declared in config\openbao.hcl (OpenBao won't
@@ -32,6 +37,7 @@
 param(
     [string]$Addr        = "http://localhost:8200",
     [string]$Container   = "openbao",
+    [string]$Network     = "local-dev-stack",
     [string]$UserName    = "",     # default: settings.local.json (asked for on first run)
     [string[]]$Policies  = @("postgres-admin", "openbao-operator"),
     [string]$SessionTtl  = "8h",
@@ -43,6 +49,8 @@ $ErrorActionPreference = "Stop"
 . (Join-Path $PSScriptRoot "Connect-OpenBao.ps1")
 $UserName = Resolve-StackUserName $UserName
 $policyDir         = Join-Path $PSScriptRoot "..\policies"
+$composeFile       = Join-Path $PSScriptRoot "..\compose.yaml"
+$script:freshInit  = $false   # true when this run initialised OpenBao
 $script:token      = $null    # the root token used for the setup
 $script:tokenKind  = $null    # 'temporary' (generated here) or 'original' (pasted, first run)
 $script:unsealKey  = $null
@@ -53,6 +61,12 @@ $script:succeeded  = $false
 function Write-Step([string]$Text) { Write-Host "`n== $Text" -ForegroundColor Cyan }
 function Write-Ok([string]$Text)   { Write-Host "OK    $Text" -ForegroundColor Green }
 function Write-Info([string]$Text) { Write-Host "INFO  $Text" -ForegroundColor Yellow }
+
+function Invoke-Native([scriptblock]$Command) {
+    $previous = $ErrorActionPreference
+    $ErrorActionPreference = "Continue"
+    try { & $Command } finally { $ErrorActionPreference = $previous }
+}
 
 function Read-Secret([string]$Prompt) {
     $secure = Read-Host -Prompt $Prompt -AsSecureString
@@ -162,22 +176,79 @@ function Complete-Setup {
     $script:token = $null; $script:unsealKey = $null
 }
 
+# A brand-new OpenBao that didn't finish setting up holds nothing yet, and its root token
+# was never shown, so the simplest way back is to start again.
+function Write-FreshInitAdvice {
+    if ($script:freshInit -and -not $script:succeeded) {
+        Write-Host ("INFO  OpenBao was initialised by this run but setup didn't finish. Start again: " +
+            "'docker compose down -v' in the openbao folder, then run this script again. " +
+            "The unseal key shown above won't be needed.") -ForegroundColor Yellow
+    }
+}
+
 function Stop-Setup([string]$Message) {
     Write-Host "STOP  $Message" -ForegroundColor Red
+    Write-FreshInitAdvice
     Complete-Setup
     exit 1
 }
 
-trap { Write-Host "ERROR $($_.Exception.Message)" -ForegroundColor Red; Complete-Setup; break }
+trap { Write-Host "ERROR $($_.Exception.Message)" -ForegroundColor Red; Write-FreshInitAdvice; Complete-Setup; break }
 
-# ---------- 1. unseal key ----------
+# ---------- 1. container ----------
 
-Write-Step "OpenBao"
-try { $status = Invoke-RestMethod "$Addr/v1/sys/seal-status" }
-catch { Stop-Setup "OpenBao not reachable at $Addr - start it from the openbao folder: docker compose up -d" }
-if (-not $status.initialized) { Stop-Setup "OpenBao is not initialised - see the OpenBao section of the README" }
+Write-Step "Container"
+Invoke-Native { docker version --format '{{.Server.Version}}' *>$null }
+if ($LASTEXITCODE -ne 0) { Stop-Setup "Docker isn't running - start Docker Desktop and try again" }
 
-$script:unsealKey = Read-Secret "Unseal key"
+Invoke-Native { docker network inspect $Network *>$null }
+if ($LASTEXITCODE -ne 0) {
+    Invoke-Native { docker network create $Network *>$null }
+    if ($LASTEXITCODE -ne 0) { Stop-Setup "Could not create the Docker network '$Network'" }
+    Write-Ok "Created the Docker network '$Network'"
+} else {
+    Write-Ok "Docker network '$Network' exists"
+}
+
+Invoke-Native { docker compose -f $composeFile up -d }
+if ($LASTEXITCODE -ne 0) { Stop-Setup "docker compose up failed - check: docker compose -f `"$composeFile`" logs" }
+
+$status = $null
+$deadline = (Get-Date).AddSeconds(60)
+while (-not $status -and (Get-Date) -lt $deadline) {
+    try { $status = Invoke-RestMethod "$Addr/v1/sys/seal-status" } catch { Start-Sleep -Seconds 1 }
+}
+if (-not $status) { Stop-Setup "OpenBao didn't answer at $Addr within 60 seconds - check: docker logs $Container" }
+Write-Ok "Running at $Addr"
+
+# ---------- 2. initialise (first run only) and unseal ----------
+
+Write-Step "Initialise and unseal"
+if (-not $status.initialized) {
+    if ($UseRootToken) { Stop-Setup "OpenBao isn't initialised yet, so there's no root token to use - run without -UseRootToken" }
+    try {
+        $init = Invoke-RestMethod "$Addr/v1/sys/init" -Method Put `
+            -Body (@{ secret_shares = 1; secret_threshold = 1 } | ConvertTo-Json) -ContentType "application/json"
+    } catch { Stop-Setup "Initialising failed: $(Get-ErrorText $_)" }
+    $script:freshInit = $true
+    $script:unsealKey = @($init.keys_base64)[0]
+    $script:token     = $init.root_token       # used for this run only, never shown
+    $script:tokenKind = "original"
+    $init = $null
+    Write-Ok "Initialised with one unseal key share"
+
+    Write-Host ""
+    Write-Host "  UNSEAL KEY  $($script:unsealKey)" -ForegroundColor White -BackgroundColor DarkRed
+    Write-Host ""
+    Write-Host "  Save it in your password manager now. It's shown only this once, it isn't stored" -ForegroundColor Yellow
+    Write-Host "  anywhere else, and without it OpenBao's data can't be unsealed after a restart." -ForegroundColor Yellow
+    while ((Read-Host "Type 'saved' once it's in your password manager") -ne "saved") { }
+    Clear-Host
+    Write-Ok "Unseal key saved (cleared from the screen)"
+} else {
+    $script:unsealKey = Read-Secret "Unseal key"
+}
+
 if ($status.sealed) {
     try {
         $result = Invoke-RestMethod "$Addr/v1/sys/unseal" -Method Put `
@@ -189,17 +260,17 @@ if ($status.sealed) {
     Write-Ok "Already unsealed"
 }
 
-# ---------- 2. a root token for this run ----------
+# ---------- 3. a root token for this run ----------
 
 Write-Step "Root token for this run"
 $userpassEnabled = $false
-try {
+if (-not $script:freshInit) { try {
     Invoke-RestMethod "$Addr/v1/auth/userpass/login/__probe__" -Method Post `
         -Body (@{ password = "x" } | ConvertTo-Json) -ContentType "application/json" | Out-Null
 } catch {
     # A missing user/password is a 400; a missing login method is a 404/405 or 'no handler'
     $userpassEnabled = (Get-StatusCode $_) -eq 400 -and "$($_.ErrorDetails.Message)" -notmatch "no handler"
-}
+} }
 
 $loginToken = $null
 if ($userpassEnabled -and -not $UseRootToken) {
@@ -207,7 +278,9 @@ if ($userpassEnabled -and -not $UseRootToken) {
     catch { Write-Info $_.Exception.Message }
 }
 
-if ($loginToken) {
+if ($script:freshInit) {
+    Write-Ok "Using the root token from initialising (never shown; revoked at the end)"
+} elseif ($loginToken) {
     try {
         $script:token     = New-TemporaryRootToken $loginToken
         $script:tokenKind = "temporary"
@@ -222,7 +295,7 @@ if ($loginToken) {
     }
 } else {
     if (-not $UseRootToken) { Write-Info "No '$UserName' login yet - this looks like the first run" }
-    $script:token     = Read-Secret "Root token from 'bao operator init' (revoked once your login works)"
+    $script:token     = Read-Secret "Root token (revoked once your login works)"
     $script:tokenKind = "original"
 }
 
@@ -231,7 +304,7 @@ if (@($self.policies) -notcontains "root") { $script:tokenKind = $null; Stop-Set
 $currentAccessor = $self.accessor
 Write-Ok "Working as root for this run only"
 
-# ---------- 3. audit log ----------
+# ---------- 4. audit log ----------
 
 # The audit log is declared in config\openbao.hcl: OpenBao won't create audit devices
 # through the API. A SIGHUP makes it load a config change without sealing.
@@ -259,7 +332,7 @@ if (-not $auditDevice) {
 }
 Write-Ok "On (declared in config\openbao.hcl) - every request goes to 'docker logs $Container'"
 
-# ---------- 4. policies ----------
+# ---------- 5. policies ----------
 
 Write-Step "Policies"
 $policyFiles = @(Get-ChildItem -Path $policyDir -Filter *.hcl -ErrorAction SilentlyContinue)
@@ -272,7 +345,7 @@ foreach ($file in $policyFiles) {
     Write-Ok "Loaded policy '$($file.BaseName)'"
 }
 
-# ---------- 5. your login ----------
+# ---------- 6. your login ----------
 
 Write-Step "Your login ($UserName)"
 if ((Get-MountNames (Invoke-Bao Get "sys/auth")) -notcontains "userpass/") {
@@ -314,7 +387,7 @@ if ($newPassword) {
     Write-Ok "Logged in as '$UserName' with the new password"
 }
 
-# ---------- 6. prove you can get back in ----------
+# ---------- 7. prove you can get back in ----------
 
 # Before the original root token goes, check your login plus the unseal key really can
 # create a root token, so you're never locked out of admin changes.
@@ -331,7 +404,7 @@ if ($script:tokenKind -eq "original") {
     }
 }
 
-# ---------- 7. no root tokens left behind ----------
+# ---------- 8. no root tokens left behind ----------
 
 Write-Step "Root tokens"
 $revoked = 0

@@ -13,29 +13,25 @@ Run the commands below from this `openbao` folder. To build the whole stack from
 
 ## First-time setup
 
-The shared `local-dev-stack` Docker network must exist first (`docker network create local-dev-stack`, once per machine). Then:
-
-```powershell
-docker compose up -d
-
-# One-off initialisation: prints an unseal key and a root token
-docker exec -it openbao bao operator init -key-shares=1 -key-threshold=1 -address=http://127.0.0.1:8200
-```
-
-Store the **unseal key** in a password manager. It's only shown once, it never goes in this repo, and the data can't be recovered without it. You only need the root token for the next step, after which it's revoked.
-
-Then set up the audit log, the policies and your own login:
+One script does everything:
 
 ```powershell
 .\scripts\Initialize-OpenBao.ps1
 ```
 
-On this first run it asks for the unseal key and the root token from `bao operator init`. It:
+On the first run it:
 
-1. checks the **audit log** is on. Every request goes to OpenBao's output, so `docker logs openbao` shows who asked for what and when. Secret values are HMAC-hashed in the log, never written in plain text. The audit log is declared in `config\openbao.hcl`, because OpenBao no longer lets the API create audit devices (a security fix); if it isn't loaded yet, the script makes OpenBao reload its config
-2. loads every policy in `policies\*.hcl`
-3. turns on username/password logins and creates your user, `<username>` (the name in `settings.local.json`, asked for on first run), with the `postgres-admin` and `openbao-operator` policies and 8-hour sessions. It asks you to choose a password; store it in your password manager
-4. checks the new login works, then **revokes every root token**, including the one you just used
+1. creates the shared `local-dev-stack` Docker network if it's missing, and starts the container (`docker compose up -d`)
+2. **initialises OpenBao** with one unseal key share, and shows the **unseal key** once. It waits until you type `saved`, then clears it from the screen. Store it in your password manager: it never goes in this repo, and the data can't be recovered without it. The **root token** is kept in memory for this run only and never shown
+3. unseals OpenBao
+4. checks the **audit log** is on. Every request goes to OpenBao's output, so `docker logs openbao` shows who asked for what and when. Secret values are HMAC-hashed in the log, never written in plain text. The audit log is declared in `config\openbao.hcl`, because OpenBao no longer lets the API create audit devices (a security fix); if it isn't loaded yet, the script makes OpenBao reload its config
+5. loads every policy in `policies\*.hcl`
+6. turns on username/password logins and creates your user, `<username>` (the name in `settings.local.json`, asked for on first run), with the `postgres-admin` and `openbao-operator` policies and 8-hour sessions. It asks you to choose a password; store it in your password manager
+7. checks the new login works, then **revokes every root token**, including the one it used
+
+If the first run stops part-way, OpenBao holds nothing yet: run `docker compose down -v` and the script again. The unseal key it showed won't be needed.
+
+On later runs it starts the container if needed and asks for the unseal key.
 
 ## No root token
 
