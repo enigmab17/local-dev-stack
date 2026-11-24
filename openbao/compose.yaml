@@ -1,0 +1,31 @@
+services:
+  openbao:
+    image: openbao/openbao:2.6.6
+    container_name: openbao
+    restart: unless-stopped   # comes back after crashes and reboots (sealed), stays down if you stop it
+    command: server -config=/etc/openbao/openbao.hcl
+    ports:
+      - "8200:8200"
+    volumes:
+      - ./config:/etc/openbao:ro
+      - openbao-data:/openbao/file
+    networks:
+      - local-dev-stack   # shared with the other services, so OpenBao can reach them by name
+    healthcheck:
+      # exit 0 = unsealed, 2 = sealed, 1 = not responding → healthy if not 1
+      test: ["CMD-SHELL", "bao status -address=http://127.0.0.1:8200 >/dev/null 2>&1; [ $$? -ne 1 ]"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"         # at most ~30 MB, audit log included (it goes to stdout)
+
+volumes:
+  openbao-data:
+
+networks:
+  local-dev-stack:
+    external: true   # one-off: docker network create local-dev-stack
